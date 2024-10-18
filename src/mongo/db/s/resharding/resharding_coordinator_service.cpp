@@ -152,6 +152,7 @@ MONGO_FAIL_POINT_DEFINE(pauseAfterInsertCoordinatorDoc);
 MONGO_FAIL_POINT_DEFINE(pauseBeforeCTHolderInitialization);
 
 const std::string kReshardingCoordinatorActiveIndexName = "ReshardingCoordinatorActiveIndex";
+const int kReshardingNumInitialChunksDefault = 90;
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 const WriteConcernOptions kMajorityWriteConcern{
     WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
@@ -1228,7 +1229,7 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
     } else {
         int numInitialChunks = coordinatorDoc.getNumInitialChunks()
             ? *coordinatorDoc.getNumInitialChunks()
-            : cm.numChunks();
+            : kReshardingNumInitialChunksDefault;
 
         ShardKeyPattern shardKey(coordinatorDoc.getReshardingKey());
         const auto tempNs = coordinatorDoc.getTempReshardingNss();
@@ -2324,11 +2325,15 @@ void ReshardingCoordinator::_calculateParticipantsAndChunksThenWriteToDisk() {
         opCtx.get(), _ctHolder->getAbortToken());
 }
 
-ReshardingApproxCopySize computeApproxCopySize(ReshardingCoordinatorDocument& coordinatorDoc) {
-    const auto numRecipients = coordinatorDoc.getRecipientShards().size();
+ReshardingApproxCopySize computeApproxCopySize(OperationContext* opCtx,
+                                               ReshardingCoordinatorDocument& coordinatorDoc) {
+    const auto [cm, _] = uassertStatusOK(
+        RoutingInformationCache::get(opCtx)->getTrackedCollectionRoutingInfoWithPlacementRefresh(
+            opCtx, coordinatorDoc.getTempReshardingNss()));
+    const auto numRecipientsToCopy = cm.getNShardsOwningChunks();
     iassert(ErrorCodes::BadValue,
-            "Expected to find at least one recipient in the coordinator document",
-            numRecipients > 0);
+            "Expected to find at least one recipient for the collection",
+            numRecipientsToCopy > 0);
 
     // Compute the aggregate for the number of documents and bytes to copy.
     long aggBytesToCopy = 0, aggDocumentsToCopy = 0;
@@ -2344,8 +2349,8 @@ ReshardingApproxCopySize computeApproxCopySize(ReshardingCoordinatorDocument& co
 
     // Calculate the approximate number of documents and bytes that each recipient will clone.
     ReshardingApproxCopySize approxCopySize;
-    approxCopySize.setApproxBytesToCopy(aggBytesToCopy / numRecipients);
-    approxCopySize.setApproxDocumentsToCopy(aggDocumentsToCopy / numRecipients);
+    approxCopySize.setApproxBytesToCopy(aggBytesToCopy / numRecipientsToCopy);
+    approxCopySize.setApproxDocumentsToCopy(aggDocumentsToCopy / numRecipientsToCopy);
     return approxCopySize;
 }
 
@@ -2368,12 +2373,14 @@ ExecutorFuture<void> ReshardingCoordinator::_awaitAllDonorsReadyToDonate(
 
             auto highestMinFetchTimestamp = resharding::getHighestMinFetchTimestamp(
                 coordinatorDocChangedOnDisk.getDonorShards());
-
-            _updateCoordinatorDocStateAndCatalogEntries(
-                CoordinatorStateEnum::kCloning,
-                coordinatorDocChangedOnDisk,
-                highestMinFetchTimestamp,
-                computeApproxCopySize(coordinatorDocChangedOnDisk));
+            auto approxCopySize = [&] {
+                auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                return computeApproxCopySize(opCtx.get(), coordinatorDocChangedOnDisk);
+            }();
+            _updateCoordinatorDocStateAndCatalogEntries(CoordinatorStateEnum::kCloning,
+                                                        coordinatorDocChangedOnDisk,
+                                                        highestMinFetchTimestamp,
+                                                        approxCopySize);
         })
         .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); });
 }

@@ -656,7 +656,9 @@ boost::optional<BSONObj> ReshardingRecipientService::RecipientStateMachine::repo
 }
 
 void ReshardingRecipientService::RecipientStateMachine::onReshardingFieldsChanges(
-    OperationContext* opCtx, const TypeCollectionReshardingFields& reshardingFields) {
+    OperationContext* opCtx,
+    const TypeCollectionReshardingFields& reshardingFields,
+    bool noChunksToCopy) {
     if (reshardingFields.getState() == CoordinatorStateEnum::kAborting) {
         abort(reshardingFields.getUserCanceled().value());
         return;
@@ -669,11 +671,15 @@ void ReshardingRecipientService::RecipientStateMachine::onReshardingFieldsChange
         invariant(recipientFields.getCloneTimestamp());
         invariant(recipientFields.getApproxDocumentsToCopy());
         invariant(recipientFields.getApproxBytesToCopy());
+
+        int64_t approxDocumentsToCopy =
+            noChunksToCopy ? 0 : *recipientFields.getApproxDocumentsToCopy();
+        int64_t approxBytesToCopy = noChunksToCopy ? 0 : *recipientFields.getApproxBytesToCopy();
         ensureFulfilledPromise(lk,
                                _allDonorsPreparedToDonate,
                                {*recipientFields.getCloneTimestamp(),
-                                *recipientFields.getApproxDocumentsToCopy(),
-                                *recipientFields.getApproxBytesToCopy(),
+                                approxDocumentsToCopy,
+                                approxBytesToCopy,
                                 recipientFields.getDonorShards()});
     }
 
@@ -1405,6 +1411,12 @@ void ReshardingRecipientService::RecipientStateMachine::_updateRecipientDocument
         if (cloneDetails) {
             setBuilder.append(ReshardingRecipientDocument::kCloneTimestampFieldName,
                               cloneDetails->cloneTimestamp);
+            setBuilder.append(ReshardingRecipientDocument::kMetricsFieldName + "." +
+                                  ReshardingRecipientMetrics::kApproxBytesToCopyFieldName,
+                              cloneDetails->approxBytesToCopy);
+            setBuilder.append(ReshardingRecipientDocument::kMetricsFieldName + "." +
+                                  ReshardingRecipientMetrics::kApproxDocumentsToCopyFieldName,
+                              cloneDetails->approxDocumentsToCopy);
 
             BSONArrayBuilder donorShardsArrayBuilder;
             for (const auto& donor : cloneDetails->donorShards) {
